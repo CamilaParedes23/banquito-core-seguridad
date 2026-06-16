@@ -7,6 +7,7 @@ import com.banquito.platform.identity.domain.repository.*;
 import com.banquito.platform.identity.infrastructure.security.JwtService;
 import com.banquito.platform.identity.shared.exception.BusinessException;
 import com.banquito.platform.identity.shared.util.HashUtil;
+import com.banquito.platform.identity.api.dto.internal.AuthenticatedActor;
 import io.jsonwebtoken.Claims;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -92,7 +93,7 @@ public class AuthenticationService {
         sesionRepository.save(sesion);
 
         auditoriaService.registrarUsuario(usuario, "LOGIN_SUCCESS", ResultadoAuditoriaSeguridadEnum.OK, ip, userAgent, null);
-        return new TokenResponse(accessToken, refreshToken, "Bearer", jwtService.accessTokenSeconds(), sesion.getUuidSesion(), usuario.getUuidUsuario(), usuario.getTipoActor().getValue(), roles, scopes);
+        return tokenResponse(accessToken, refreshToken, sesion.getUuidSesion(), usuario, roles, scopes);
     }
 
     @Transactional
@@ -121,7 +122,7 @@ public class AuthenticationService {
         sesion.setUserAgent(userAgent);
         sesionRepository.save(sesion);
         auditoriaService.registrarUsuario(usuario, "TOKEN_REFRESH", ResultadoAuditoriaSeguridadEnum.OK, ip, userAgent, null);
-        return new TokenResponse(accessToken, refreshToken, "Bearer", jwtService.accessTokenSeconds(), sesion.getUuidSesion(), usuario.getUuidUsuario(), usuario.getTipoActor().getValue(), roles, scopes);
+        return tokenResponse(accessToken, refreshToken, sesion.getUuidSesion(), usuario, roles, scopes);
     }
 
     @Transactional
@@ -159,15 +160,45 @@ public class AuthenticationService {
         try {
             Claims claims = jwtService.parseClaims(cleanBearer(request.token()));
             List<String> scopes = claims.get("scopes", List.class);
-            boolean hasScope = request.requiredScope() == null || request.requiredScope().isBlank() || scopes.contains(request.requiredScope());
-            if (!hasScope) {
-                return new TokenIntrospectionResponse(false, claims.getSubject(), null, null, null, List.of(), scopes, null);
-            }
             List<String> roles = claims.get("roles", List.class);
-            Long expiration = claims.getExpiration() == null ? null : claims.getExpiration().toInstant().getEpochSecond();
-            return new TokenIntrospectionResponse(true, claims.getSubject(), (String) claims.get("actorType"), (String) claims.get("username"), (String) claims.get("clientId"), roles, scopes, expiration);
+            scopes = scopes == null ? List.of() : scopes;
+            roles = roles == null ? List.of() : roles;
+
+            if (!isAccessTokenSessionActive(claims)) {
+                return inactiveIntrospection();
+            }
+
+            boolean hasScope = request.requiredScope() == null
+                    || request.requiredScope().isBlank()
+                    || scopes.contains(request.requiredScope());
+            if (!hasScope) {
+                return new TokenIntrospectionResponse(
+                        false,
+                        claims.getSubject(),
+                        (String) claims.get("actorType"),
+                        (String) claims.get("username"),
+                        (String) claims.get("clientId"),
+                        roles,
+                        scopes,
+                        null
+                );
+            }
+
+            Long expiration = claims.getExpiration() == null
+                    ? null
+                    : claims.getExpiration().toInstant().getEpochSecond();
+            return new TokenIntrospectionResponse(
+                    true,
+                    claims.getSubject(),
+                    (String) claims.get("actorType"),
+                    (String) claims.get("username"),
+                    (String) claims.get("clientId"),
+                    roles,
+                    scopes,
+                    expiration
+            );
         } catch (Exception e) {
-            return new TokenIntrospectionResponse(false, null, null, null, null, List.of(), List.of(), null);
+            return inactiveIntrospection();
         }
     }
 
@@ -186,7 +217,81 @@ public class AuthenticationService {
         List<String> scopes = permissionQueryService.scopesActivos(client);
         String token = jwtService.generateClientAccessToken(client, jwtService.newJti(), scopes);
         auditoriaService.registrarClienteTecnico(client, "CLIENT_AUTH_SUCCESS", ResultadoAuditoriaSeguridadEnum.OK, ip, userAgent, null);
-        return new TokenResponse(token, null, "Bearer", jwtService.accessTokenSeconds(), null, client.getClientId(), "SERVICIO", List.of("SERVICE_CLIENT"), scopes);
+        return new TokenResponse(token, null, "Bearer", jwtService.accessTokenSeconds(), null, client.getClientId(), "SERVICIO", List.of("SERVICE_CLIENT"), scopes, null, "SERVICE", null);
+    }
+
+    @Transactional(readOnly = true)
+    public AuthenticatedSessionResponse me(AuthenticatedActor actor) {
+        if (actor == null) {
+            throw new BusinessException("AUTH_SESSION_REQUIRED", "No se encontró una sesión autenticada", HttpStatus.UNAUTHORIZED);
+        }
+        return new AuthenticatedSessionResponse(
+                actor.subject(),
+                actor.username(),
+                actor.actorType(),
+                actor.clientId(),
+                actor.roles(),
+                actor.scopes(),
+                actor.referenceUuid(),
+                actor.referenceType(),
+                actor.customerUuid()
+        );
+    }
+
+    private boolean isAccessTokenSessionActive(Claims claims) {
+        String actorType = (String) claims.get("actorType");
+        if ("SERVICIO".equalsIgnoreCase(actorType)) {
+            return true;
+        }
+
+        String jti = claims.getId();
+        String subject = claims.getSubject();
+        if (jti == null || jti.isBlank() || subject == null || subject.isBlank()) {
+            return false;
+        }
+
+        return sesionRepository.existsByAccessTokenJtiAndEstadoAndUsuario_UuidUsuario(
+                jti,
+                EstadoSesionEnum.ACTIVA,
+                subject
+        );
+    }
+
+    private TokenIntrospectionResponse inactiveIntrospection() {
+        return new TokenIntrospectionResponse(
+                false,
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                null
+        );
+    }
+
+    private TokenResponse tokenResponse(String accessToken, String refreshToken, String sessionUuid, UsuarioIdentidad usuario, List<String> roles, List<String> scopes) {
+        String referenceUuid = blankToNull(usuario.getUuidReferenciaExterna());
+        String referenceType = blankToNull(usuario.getReferenciaTipo());
+        String customerUuid = "CUSTOMER".equalsIgnoreCase(referenceType) ? referenceUuid : null;
+        return new TokenResponse(
+                accessToken,
+                refreshToken,
+                "Bearer",
+                jwtService.accessTokenSeconds(),
+                sessionUuid,
+                usuario.getUuidUsuario(),
+                usuario.getTipoActor().getValue(),
+                roles,
+                scopes,
+                referenceUuid,
+                referenceType,
+                customerUuid
+        );
+    }
+
+    private String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     private String secureToken() {

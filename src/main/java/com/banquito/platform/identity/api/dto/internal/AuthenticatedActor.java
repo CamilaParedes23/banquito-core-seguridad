@@ -8,5 +8,8 @@ public record AuthenticatedActor(
         String actorType,
         String clientId,
         List<String> roles,
-        List<String> scopes
+        List<String> scopes,
+        String referenceUuid,
+        String referenceType,
+        String customerUuid
 ) {}

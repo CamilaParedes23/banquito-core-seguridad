@@ -111,3 +111,18 @@ jdbc:mysql://mysql-identity:3306/banquito_identity_access_db?useSSL=false&allowP
 - `AuthenticationEntryPoint` y `AccessDeniedHandler` para 401/403 estructurados.
 - Variables de entorno para local/cloud.
 - Dockerfile listo para nube.
+
+## Seguridad y autorización agregada
+
+El JWT de usuarios humanos ahora incluye contexto de propiedad cuando la identidad está enlazada a un recurso externo:
+
+```json
+{
+  "referenceUuid": "...",
+  "referenceType": "CUSTOMER",
+  "customerUuid": "..."
+}
+```
+
+Esto permite que los microservicios de Core validen autorización horizontal: un cliente solo puede operar recursos asociados a su propio `customerUuid`. También se expone `GET /api/v1/auth/me` para que el frontend pueda identificar rol, scopes y `customerUuid` sin decodificar manualmente el token.
+

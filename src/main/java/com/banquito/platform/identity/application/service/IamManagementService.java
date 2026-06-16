@@ -5,17 +5,28 @@ import com.banquito.platform.identity.domain.enums.*;
 import com.banquito.platform.identity.domain.model.*;
 import com.banquito.platform.identity.domain.repository.*;
 import com.banquito.platform.identity.shared.exception.BusinessException;
+import jakarta.persistence.criteria.Predicate;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
 @Service
 public class IamManagementService {
+    private static final int DEFAULT_PAGE_SIZE = 20;
+    private static final int MAX_PAGE_SIZE = 100;
+
     private final UsuarioIdentidadRepository usuarioRepository;
     private final RolRepository rolRepository;
     private final PermisoRepository permisoRepository;
@@ -51,32 +62,92 @@ public class IamManagementService {
 
     @Transactional
     public UserDetailResponse createUser(CreateUserRequest request) {
-        if (usuarioRepository.existsByUsername(request.username())) {
+        String username = normalizeRequiredText(request.username(), "username");
+        if (usuarioRepository.existsByUsernameIgnoreCase(username)) {
             throw new BusinessException("IAM_USERNAME_EXISTS", "El nombre de usuario ya existe", HttpStatus.CONFLICT);
         }
-        if (request.email() != null && usuarioRepository.existsByEmail(request.email())) {
+
+        String email = normalizeOptionalText(request.email());
+        if (email != null && usuarioRepository.existsByEmailIgnoreCase(email)) {
             throw new BusinessException("IAM_EMAIL_EXISTS", "El correo ya se encuentra registrado", HttpStatus.CONFLICT);
         }
+
+        TipoActorEnum actorType = parseActorType(request.actorType());
+        EstadoUsuarioIdentidadEnum status = parseUserStatus(request.status(), EstadoUsuarioIdentidadEnum.ACTIVO);
+        LocalDateTime now = LocalDateTime.now();
+
         UsuarioIdentidad usuario = new UsuarioIdentidad();
         usuario.setUuidUsuario(UUID.randomUUID().toString());
-        usuario.setUsername(request.username());
-        usuario.setEmail(request.email());
-        usuario.setTelefonoMovil(request.telefonoMovil());
+        usuario.setUsername(username);
+        usuario.setEmail(email);
+        usuario.setTelefonoMovil(normalizeOptionalText(request.telefonoMovil()));
         usuario.setPasswordHash(passwordEncoder.encode(request.password()));
         usuario.setPasswordAlgorithm("BCrypt");
-        usuario.setPasswordUpdatedAt(LocalDateTime.now());
+        usuario.setPasswordUpdatedAt(now);
         usuario.setRequiereCambioPassword(Boolean.TRUE.equals(request.requirePasswordChange()));
         usuario.setEmailVerificado(false);
-        usuario.setTipoActor(TipoActorEnum.valueOf(request.actorType()));
-        usuario.setEstado(EstadoUsuarioIdentidadEnum.ACTIVO);
+        usuario.setTipoActor(actorType);
+        usuario.setEstado(status);
         usuario.setIntentosFallidos(0);
-        usuario.setUuidReferenciaExterna(request.externalReferenceUuid());
-        usuario.setReferenciaTipo(request.referenceType());
-        usuario.setFechaCreacion(LocalDateTime.now());
-        usuario.setFechaActualizacion(LocalDateTime.now());
+        usuario.setUuidReferenciaExterna(normalizeOptionalText(request.externalReferenceUuid()));
+        usuario.setReferenciaTipo(normalizeOptionalText(request.referenceType()));
+        usuario.setFechaCreacion(now);
+        usuario.setFechaActualizacion(now);
         usuario.setVersion(0);
-        usuarioRepository.save(usuario);
-        return toUserDetail(usuario);
+
+        UsuarioIdentidad saved = usuarioRepository.saveAndFlush(usuario);
+        assignInitialRoles(saved, request.roleCodes());
+        return toUserDetail(saved);
+    }
+
+    @Transactional(readOnly = true)
+    public UserListResponse listUsers(String actorType,
+                                      String status,
+                                      String username,
+                                      String search,
+                                      Integer page,
+                                      Integer size) {
+        Pageable pageable = PageRequest.of(normalizePage(page), normalizeSize(size), Sort.by(Sort.Direction.ASC, "username"));
+        TipoActorEnum actorFilter = actorType == null || actorType.isBlank() ? null : parseActorType(actorType);
+        EstadoUsuarioIdentidadEnum statusFilter = status == null || status.isBlank() ? null : parseUserStatus(status, null);
+        String usernameFilter = normalizeOptionalText(username);
+        String searchFilter = normalizeOptionalText(search);
+
+        Specification<UsuarioIdentidad> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            if (actorFilter != null) {
+                predicates.add(cb.equal(root.get("tipoActor"), actorFilter));
+            }
+            if (statusFilter != null) {
+                predicates.add(cb.equal(root.get("estado"), statusFilter));
+            }
+            if (usernameFilter != null) {
+                predicates.add(cb.like(cb.lower(root.get("username")), "%" + usernameFilter.toLowerCase(Locale.ROOT) + "%"));
+            }
+            if (searchFilter != null) {
+                String term = "%" + searchFilter.toLowerCase(Locale.ROOT) + "%";
+                predicates.add(cb.or(
+                        cb.like(cb.lower(root.get("username")), term),
+                        cb.like(cb.lower(root.get("email")), term),
+                        cb.like(cb.lower(root.get("telefonoMovil")), term),
+                        cb.like(cb.lower(root.get("uuidReferenciaExterna")), term),
+                        cb.like(cb.lower(root.get("referenciaTipo")), term)
+                ));
+            }
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+
+        Page<UsuarioIdentidad> usersPage = usuarioRepository.findAll(spec, pageable);
+        List<UserSummaryResponse> users = usersPage.getContent().stream().map(this::toUserSummary).toList();
+        return new UserListResponse(usersPage.getTotalElements(), usersPage.getNumber(), usersPage.getSize(), usersPage.getTotalPages(), users);
+    }
+
+    @Transactional(readOnly = true)
+    public List<RoleResponse> listRoles(String status) {
+        EstadoGeneralEnum statusFilter = status == null || status.isBlank() ? EstadoGeneralEnum.ACTIVO : parseGeneralStatus(status);
+        return rolRepository.findByEstadoOrderByNombreAsc(statusFilter).stream()
+                .map(this::toRoleResponse)
+                .toList();
     }
 
     @Transactional(readOnly = true)
@@ -86,11 +157,19 @@ public class IamManagementService {
         return toUserDetail(usuario);
     }
 
+    @Transactional(readOnly = true)
+    public UserDetailResponse getUserByUsername(String username) {
+        UsuarioIdentidad usuario = usuarioRepository.findByUsernameIgnoreCase(username)
+                .orElseThrow(() -> new BusinessException("IAM_USER_NOT_FOUND", "Usuario no encontrado", HttpStatus.NOT_FOUND));
+        return toUserDetail(usuario);
+    }
+
     @Transactional
     public UserDetailResponse changeUserStatus(String userUuid, ChangeUserStatusRequest request) {
         UsuarioIdentidad usuario = usuarioRepository.findByUuidUsuario(userUuid)
                 .orElseThrow(() -> new BusinessException("IAM_USER_NOT_FOUND", "Usuario no encontrado", HttpStatus.NOT_FOUND));
-        usuario.setEstado(EstadoUsuarioIdentidadEnum.valueOf(request.status()));
+        usuario.setEstado(parseUserStatus(request.status(), EstadoUsuarioIdentidadEnum.ACTIVO));
+        usuario.setFechaActualizacion(LocalDateTime.now());
         usuarioRepository.save(usuario);
         return toUserDetail(usuario);
     }
@@ -128,7 +207,7 @@ public class IamManagementService {
         Rol rol = new Rol();
         rol.setCodigo(request.code());
         rol.setNombre(request.name());
-        rol.setTipoRol(TipoRolEnum.valueOf(request.roleType()));
+        rol.setTipoRol(parseRoleType(request.roleType()));
         rol.setDescripcion(request.description());
         rol.setEstado(EstadoGeneralEnum.ACTIVO);
         rol.setFechaCreacion(LocalDateTime.now());
@@ -229,6 +308,21 @@ public class IamManagementService {
         return new GenericResponse("OK", "Sesión revocada correctamente");
     }
 
+    private void assignInitialRoles(UsuarioIdentidad usuario, List<String> roleCodes) {
+        if (roleCodes == null || roleCodes.isEmpty()) {
+            return;
+        }
+        for (String roleCode : roleCodes.stream().filter(r -> r != null && !r.isBlank()).map(String::trim).distinct().toList()) {
+            Rol rol = rolRepository.findByCodigo(roleCode)
+                    .orElseThrow(() -> new BusinessException("IAM_ROLE_NOT_FOUND", "Rol no encontrado: " + roleCode, HttpStatus.NOT_FOUND));
+            usuarioRolRepository.findByUsuarioAndRolCodigo(usuario, roleCode).ifPresentOrElse(ur -> {
+                ur.setEstado(EstadoAsignacionRolEnum.ACTIVO);
+                ur.setFechaRevocacion(null);
+                usuarioRolRepository.save(ur);
+            }, () -> usuarioRolRepository.save(UsuarioRol.crear(usuario, rol, "SYSTEM")));
+        }
+    }
+
     private UserDetailResponse toUserDetail(UsuarioIdentidad usuario) {
         return new UserDetailResponse(
                 usuario.getUuidUsuario(), usuario.getUsername(), usuario.getEmail(),
@@ -238,9 +332,90 @@ public class IamManagementService {
         );
     }
 
+    private UserSummaryResponse toUserSummary(UsuarioIdentidad usuario) {
+        return new UserSummaryResponse(
+                usuario.getUuidUsuario(), usuario.getUsername(), usuario.getEmail(), usuario.getTelefonoMovil(),
+                usuario.getTipoActor().getValue(), usuario.getEstado().getValue(), usuario.getRequiereCambioPassword(),
+                usuario.getUuidReferenciaExterna(), usuario.getReferenciaTipo(), usuario.getUltimoLogin(),
+                permissionQueryService.rolesActivos(usuario)
+        );
+    }
+
+    private RoleResponse toRoleResponse(Rol rol) {
+        return new RoleResponse(rol.getCodigo(), rol.getNombre(), rol.getDescripcion(), rol.getTipoRol().getValue(), rol.getEstado().getValue());
+    }
+
     private ApiClientResponse toApiClientResponse(ApiClient client) {
         List<String> scopes = apiClientScopeRepository.findByApiClientAndEstado(client, EstadoGeneralEnum.ACTIVO)
                 .stream().map(ApiClientScope::getScope).toList();
         return new ApiClientResponse(client.getClientId(), client.getNombre(), client.getServicioOrigen(), client.getTipoCliente().getValue(), client.getEstado().getValue(), scopes);
+    }
+
+    private int normalizePage(Integer page) {
+        return page == null || page < 0 ? 0 : page;
+    }
+
+    private int normalizeSize(Integer size) {
+        if (size == null || size <= 0) return DEFAULT_PAGE_SIZE;
+        return Math.min(size, MAX_PAGE_SIZE);
+    }
+
+    private String normalizeRequiredText(String value, String fieldName) {
+        String normalized = normalizeOptionalText(value);
+        if (normalized == null) {
+            throw new BusinessException("IAM_REQUIRED_FIELD", "El campo " + fieldName + " es obligatorio", HttpStatus.BAD_REQUEST);
+        }
+        return normalized;
+    }
+
+    private String normalizeOptionalText(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isBlank() ? null : trimmed;
+    }
+
+    private TipoActorEnum parseActorType(String value) {
+        try {
+            return TipoActorEnum.valueOf(normalizeRequiredText(value, "actorType").toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ex) {
+            throw new BusinessException("IAM_INVALID_ACTOR_TYPE", "Tipo de actor inválido. Valores permitidos: CLIENTE, EMPLEADO, SERVICIO", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    private TipoRolEnum parseRoleType(String value) {
+        try {
+            return TipoRolEnum.valueOf(normalizeRequiredText(value, "roleType").toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ex) {
+            throw new BusinessException("IAM_INVALID_ROLE_TYPE", "Tipo de rol inválido. Valores permitidos: INTERNO, CLIENTE, SERVICIO", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    private EstadoGeneralEnum parseGeneralStatus(String value) {
+        String normalized = normalizeRequiredText(value, "status").toUpperCase(Locale.ROOT);
+        if ("ACTIVE".equals(normalized)) normalized = "ACTIVO";
+        if ("INACTIVE".equals(normalized)) normalized = "INACTIVO";
+        try {
+            return EstadoGeneralEnum.valueOf(normalized);
+        } catch (IllegalArgumentException ex) {
+            throw new BusinessException("IAM_INVALID_STATUS", "Estado inválido. Valores permitidos: ACTIVO, INACTIVO", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    private EstadoUsuarioIdentidadEnum parseUserStatus(String value, EstadoUsuarioIdentidadEnum defaultValue) {
+        if (value == null || value.isBlank()) return defaultValue;
+        String normalized = value.trim().toUpperCase(Locale.ROOT);
+        normalized = switch (normalized) {
+            case "ACTIVE" -> "ACTIVO";
+            case "INACTIVE" -> "INACTIVO";
+            case "BLOCKED" -> "BLOQUEADO";
+            case "PENDING" -> "PENDIENTE";
+            case "REVOKED" -> "REVOCADO";
+            default -> normalized;
+        };
+        try {
+            return EstadoUsuarioIdentidadEnum.valueOf(normalized);
+        } catch (IllegalArgumentException ex) {
+            throw new BusinessException("IAM_INVALID_USER_STATUS", "Estado de usuario inválido. Valores permitidos: ACTIVO, INACTIVO, BLOQUEADO, PENDIENTE, REVOCADO", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
     }
 }

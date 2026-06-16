@@ -48,6 +48,16 @@ public class ParametroSeguridad {
     public ParametroSeguridad() {}
     public ParametroSeguridad(String codigo) { this.codigo = codigo; }
 
+    public void actualizar(String valorTexto, EstadoGeneralEnum estado) {
+        this.valorTexto = valorTexto;
+        this.estado = estado;
+        this.fechaActualizacion = LocalDateTime.now();
+    }
+
+    public boolean estaActivo() {
+        return estado == EstadoGeneralEnum.ACTIVO;
+    }
+
     public int valorEntero(int valorDefecto) {
         try { return Integer.parseInt(valorTexto); } catch (Exception e) { return valorDefecto; }
     }

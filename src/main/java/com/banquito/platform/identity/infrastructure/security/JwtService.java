@@ -1,5 +1,6 @@
 package com.banquito.platform.identity.infrastructure.security;
 
+import com.banquito.platform.identity.application.service.ParametroSeguridadService;
 import com.banquito.platform.identity.domain.model.ApiClient;
 import com.banquito.platform.identity.domain.model.UsuarioIdentidad;
 import io.jsonwebtoken.Claims;
@@ -12,33 +13,43 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Date;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
 @Service
 public class JwtService {
     private final JwtProperties properties;
+    private final ParametroSeguridadService parametroSeguridadService;
     private final SecretKey key;
 
-    public JwtService(JwtProperties properties) {
+    public JwtService(JwtProperties properties, ParametroSeguridadService parametroSeguridadService) {
         this.properties = properties;
+        this.parametroSeguridadService = parametroSeguridadService;
         this.key = Keys.hmacShaKeyFor(properties.secret().getBytes(StandardCharsets.UTF_8));
     }
 
     public String generateUserAccessToken(UsuarioIdentidad user, String jti, List<String> roles, List<String> scopes) {
         Instant now = Instant.now();
+        Map<String, Object> claims = new LinkedHashMap<>();
+        claims.put("username", user.getUsername());
+        claims.put("actorType", user.getTipoActor().getValue());
+        claims.put("roles", roles);
+        claims.put("scopes", scopes);
+        if (user.getUuidReferenciaExterna() != null && !user.getUuidReferenciaExterna().isBlank()) {
+            claims.put("referenceUuid", user.getUuidReferenciaExterna());
+            claims.put("referenceType", user.getReferenciaTipo());
+            if ("CUSTOMER".equalsIgnoreCase(user.getReferenciaTipo())) {
+                claims.put("customerUuid", user.getUuidReferenciaExterna());
+            }
+        }
         return Jwts.builder()
                 .issuer(properties.issuer())
                 .subject(user.getUuidUsuario())
                 .id(jti)
                 .issuedAt(Date.from(now))
-                .expiration(Date.from(now.plusSeconds(properties.accessTokenMinutes() * 60)))
-                .claims(Map.of(
-                        "username", user.getUsername(),
-                        "actorType", user.getTipoActor().getValue(),
-                        "roles", roles,
-                        "scopes", scopes
-                ))
+                .expiration(Date.from(now.plusSeconds(accessTokenMinutes() * 60)))
+                .claims(claims)
                 .signWith(key)
                 .compact();
     }
@@ -50,7 +61,7 @@ public class JwtService {
                 .subject(client.getClientId())
                 .id(jti)
                 .issuedAt(Date.from(now))
-                .expiration(Date.from(now.plusSeconds(properties.accessTokenMinutes() * 60)))
+                .expiration(Date.from(now.plusSeconds(accessTokenMinutes() * 60)))
                 .claims(Map.of(
                         "clientId", client.getClientId(),
                         "actorType", "SERVICIO",
@@ -66,6 +77,12 @@ public class JwtService {
     }
 
     public String newJti() { return UUID.randomUUID().toString(); }
-    public long accessTokenSeconds() { return properties.accessTokenMinutes() * 60; }
-    public long refreshTokenDays() { return properties.refreshTokenDays(); }
+    public long accessTokenSeconds() { return accessTokenMinutes() * 60; }
+    public long refreshTokenDays() {
+        return parametroSeguridadService.getInteger("REFRESH_TOKEN_DAYS", Math.toIntExact(properties.refreshTokenDays()));
+    }
+
+    private long accessTokenMinutes() {
+        return parametroSeguridadService.getInteger("ACCESS_TOKEN_MINUTES", Math.toIntExact(properties.accessTokenMinutes()));
+    }
 }
