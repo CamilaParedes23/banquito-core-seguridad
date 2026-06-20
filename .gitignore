@@ -7,3 +7,28 @@ logs/
 .env.*
 !.env.example
 .DS_Store
+
+# BEGIN BANQUITO MANAGED EXCLUSIONS
+# Generado para impedir que artefactos, secretos y archivos locales se versionen.
+
+# Variables locales y secretos
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# IDE y sistema operativo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentación local no versionada
+docs/
+
+# Artefactos Java/Maven
+target/
+# END BANQUITO MANAGED EXCLUSIONS
