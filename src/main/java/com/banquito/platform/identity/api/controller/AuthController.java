@@ -69,6 +69,12 @@ public class AuthController {
         return passwordManagementService.resetPassword(request, ip(httpRequest), httpRequest.getHeader("User-Agent"));
     }
 
+    @PostMapping("/activate-account")
+    public GenericResponse activateAccount(@Valid @RequestBody ActivateAccountRequest request,
+                                           HttpServletRequest httpRequest) {
+        return passwordManagementService.activateAccount(request, ip(httpRequest), httpRequest.getHeader("User-Agent"));
+    }
+
     @GetMapping("/me")
     public AuthenticatedSessionResponse me(Authentication authentication) {
         AuthenticatedActor actor = authentication == null ? null : (AuthenticatedActor) authentication.getPrincipal();

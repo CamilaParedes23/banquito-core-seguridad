@@ -5,6 +5,7 @@ import com.banquito.platform.identity.domain.model.UsuarioIdentidad;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
+import java.util.List;
 import java.util.Optional;
 
 public interface UsuarioIdentidadRepository extends JpaRepository<UsuarioIdentidad, Long>, JpaSpecificationExecutor<UsuarioIdentidad> {
@@ -17,4 +18,5 @@ public interface UsuarioIdentidadRepository extends JpaRepository<UsuarioIdentid
     boolean existsByEmail(String email);
     boolean existsByEmailIgnoreCase(String email);
     long countByEstado(EstadoUsuarioIdentidadEnum estado);
+    List<UsuarioIdentidad> findByUuidReferenciaExternaAndReferenciaTipo(String uuidReferenciaExterna, String referenciaTipo);
 }

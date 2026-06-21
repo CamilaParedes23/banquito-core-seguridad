@@ -1,5 +1,6 @@
 package com.banquito.platform.identity.application.service;
 
+import com.banquito.platform.identity.api.dto.api.ActivateAccountRequest;
 import com.banquito.platform.identity.api.dto.api.ChangePasswordRequest;
 import com.banquito.platform.identity.api.dto.api.ForgotPasswordRequest;
 import com.banquito.platform.identity.api.dto.api.GenericResponse;
@@ -18,6 +19,7 @@ import com.banquito.platform.identity.domain.repository.UsuarioIdentidadReposito
 import com.banquito.platform.identity.shared.exception.BusinessException;
 import com.banquito.platform.identity.shared.tracing.CorrelationIdHolder;
 import com.banquito.platform.identity.shared.util.HashUtil;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -44,6 +46,7 @@ public class PasswordManagementService {
     private final ParametroSeguridadService parametroService;
     private final AuditoriaSeguridadService auditoriaService;
     private final ObjectMapper objectMapper;
+    private final String customerActivationBaseUrl;
     private final SecureRandom secureRandom = new SecureRandom();
 
     public PasswordManagementService(UsuarioIdentidadRepository usuarioRepository,
@@ -53,7 +56,8 @@ public class PasswordManagementService {
                                      PasswordEncoder passwordEncoder,
                                      ParametroSeguridadService parametroService,
                                      AuditoriaSeguridadService auditoriaService,
-                                     ObjectMapper objectMapper) {
+                                     ObjectMapper objectMapper,
+                                     @Value("${banquito.onboarding.customer-activation-base-url:http://localhost:5174/activar}") String customerActivationBaseUrl) {
         this.usuarioRepository = usuarioRepository;
         this.sesionRepository = sesionRepository;
         this.tokenRepository = tokenRepository;
@@ -62,6 +66,7 @@ public class PasswordManagementService {
         this.parametroService = parametroService;
         this.auditoriaService = auditoriaService;
         this.objectMapper = objectMapper;
+        this.customerActivationBaseUrl = customerActivationBaseUrl;
     }
 
     @Transactional
@@ -121,6 +126,39 @@ public class PasswordManagementService {
     }
 
     @Transactional
+    public GenericResponse activateAccount(ActivateAccountRequest request, String ip, String userAgent) {
+        PasswordRecoveryToken token = tokenRepository.findByTokenHash(HashUtil.sha256(request.token().trim()))
+                .orElseThrow(() -> new BusinessException("AUTH_ACCOUNT_ACTIVATION_TOKEN_INVALID",
+                        "El token de activación es inválido o ya fue utilizado", HttpStatus.UNPROCESSABLE_ENTITY));
+        LocalDateTime now = LocalDateTime.now();
+        if (!token.estaVigente(now)) {
+            throw new BusinessException("AUTH_ACCOUNT_ACTIVATION_TOKEN_EXPIRED",
+                    "El token de activación expiró o ya fue utilizado", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        UsuarioIdentidad usuario = token.getUsuario();
+        if (!com.banquito.platform.identity.domain.enums.EstadoUsuarioIdentidadEnum.PENDIENTE.equals(usuario.getEstado())) {
+            auditoriaService.registrarUsuario(usuario, "ACCOUNT_ACTIVATION_DENIED", ResultadoAuditoriaSeguridadEnum.DENEGADO,
+                    ip, userAgent, "{\"reason\":\"identity_not_pending\"}");
+            throw new BusinessException("AUTH_ACCOUNT_ALREADY_ACTIVE",
+                    "La identidad no se encuentra pendiente de activación", HttpStatus.CONFLICT);
+        }
+
+        validateNewPassword(usuario, request.newPassword());
+        updatePassword(usuario, request.newPassword());
+        usuario.setEstado(com.banquito.platform.identity.domain.enums.EstadoUsuarioIdentidadEnum.ACTIVO);
+        usuario.setEmailVerificado(true);
+        usuario.setFechaActualizacion(now);
+        usuarioRepository.saveAndFlush(usuario);
+        token.marcarUsado(now);
+        tokenRepository.saveAndFlush(token);
+        invalidateRecoveryTokens(usuario, now);
+        auditoriaService.registrarUsuario(usuario, "ACCOUNT_ACTIVATED", ResultadoAuditoriaSeguridadEnum.OK,
+                ip, userAgent, "{\"channel\":\"email_token\"}");
+        return new GenericResponse("ACCOUNT_ACTIVATED", "La cuenta fue activada correctamente. Ya puede iniciar sesión.");
+    }
+
+    @Transactional
     public GenericResponse resetPassword(ResetPasswordRequest request, String ip, String userAgent) {
         PasswordRecoveryToken token = tokenRepository.findByTokenHash(HashUtil.sha256(request.token().trim()))
                 .orElseThrow(() -> new BusinessException("AUTH_PASSWORD_RESET_TOKEN_INVALID",
@@ -172,6 +210,38 @@ public class PasswordManagementService {
                 usuario.getUuidUsuario(), writeJson(payload)));
         auditoriaService.registrarUsuario(usuario, "INTERNAL_USER_ACTIVATION_ISSUED", ResultadoAuditoriaSeguridadEnum.OK,
                 ip, userAgent, null);
+    }
+
+    @Transactional
+    public void issueCustomerUserActivation(String userUuid, String recipientName, String customerType, boolean switchAccess, String ip, String userAgent) {
+        UsuarioIdentidad usuario = usuarioRepository.findByUuidUsuario(userUuid)
+                .orElseThrow(() -> new BusinessException("IAM_USER_NOT_FOUND", "Usuario no encontrado", HttpStatus.NOT_FOUND));
+        if (usuario.getEmail() == null || usuario.getEmail().isBlank()) {
+            throw new BusinessException("IAM_CUSTOMER_EMAIL_REQUIRED", "El usuario cliente requiere correo electrónico para activación", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        invalidateRecoveryTokens(usuario, now);
+        String rawToken = secureToken();
+        int expirationMinutes = parametroService.getInteger("CUSTOMER_ACTIVATION_TOKEN_MINUTES", 1440);
+        PasswordRecoveryToken token = PasswordRecoveryToken.crear(
+                usuario, HashUtil.sha256(rawToken), now.plusMinutes(expirationMinutes), ip, userAgent);
+        tokenRepository.saveAndFlush(token);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("notificationType", "CUSTOMER_USER_ACTIVATION_REQUESTED");
+        payload.put("recipient", usuario.getEmail());
+        payload.put("recipientName", recipientName == null || recipientName.isBlank() ? usuario.getUsername() : recipientName);
+        payload.put("username", usuario.getUsername());
+        payload.put("activationToken", rawToken);
+        payload.put("expiresInMinutes", expirationMinutes);
+        payload.put("customerType", customerType);
+        payload.put("switchAccessEnabled", switchAccess);
+        payload.put("activationUrl", activationUrl(rawToken));
+        payload.put("correlationId", CorrelationIdHolder.get());
+        outboxRepository.saveAndFlush(OutboxEvent.pendiente(
+                CorrelationIdHolder.get(), "CUSTOMER_USER_ACTIVATION_REQUESTED", "USUARIO_IDENTIDAD",
+                usuario.getUuidUsuario(), writeJson(payload)));
+        auditoriaService.registrarUsuario(usuario, "CUSTOMER_USER_ACTIVATION_ISSUED", ResultadoAuditoriaSeguridadEnum.OK,
+                ip, userAgent, "{\"delivery\":\"email\"}");
     }
 
     private UsuarioIdentidad requireHumanUser(AuthenticatedActor actor) {
@@ -227,6 +297,13 @@ public class PasswordManagementService {
         if (!active.isEmpty()) {
             tokenRepository.saveAllAndFlush(active);
         }
+    }
+
+    private String activationUrl(String token) {
+        String base = customerActivationBaseUrl == null || customerActivationBaseUrl.isBlank()
+                ? "http://localhost:5174/activar"
+                : customerActivationBaseUrl.trim();
+        return base + (base.contains("?") ? "&" : "?") + "token=" + token;
     }
 
     private String secureToken() {
