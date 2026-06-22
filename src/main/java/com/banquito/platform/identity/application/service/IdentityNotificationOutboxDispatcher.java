@@ -20,6 +20,9 @@ public class IdentityNotificationOutboxDispatcher {
     private static final Logger log = LoggerFactory.getLogger(IdentityNotificationOutboxDispatcher.class);
     private static final List<String> SUPPORTED_EVENTS = List.of(
             "PASSWORD_RESET_REQUESTED", "INTERNAL_USER_ONBOARDING_COMPLETED", "CUSTOMER_USER_ACTIVATION_REQUESTED");
+    private static final String CUSTOMER_ACTIVATION_TEMPLATE = "CUSTOMER_USER_ACTIVATION_EMAIL";
+    private static final String INTERNAL_ACTIVATION_TEMPLATE = "INTERNAL_USER_ACTIVATION_EMAIL";
+    private static final String PASSWORD_RESET_TEMPLATE = "PASSWORD_RESET_EMAIL";
 
     private final IdentityOutboxService outboxService;
     private final RestClient notificationClient;
@@ -77,31 +80,7 @@ public class IdentityNotificationOutboxDispatcher {
         String token = string(payload, internalOnboarding || customerOnboarding ? "activationToken" : "resetToken");
         String username = string(payload, "username");
         String recipientName = string(payload, customerOnboarding ? "recipientName" : "username");
-
-        String subject;
-        String body;
-        String actorType = internalOnboarding ? "EMPLEADO" : "CLIENTE";
-        if (customerOnboarding) {
-            boolean switchAccess = "true".equalsIgnoreCase(string(payload, "switchAccessEnabled"));
-            subject = switchAccess
-                    ? "Active su acceso empresarial y pagos masivos BanQuito"
-                    : "Active su acceso digital Banco BanQuito";
-            body = "Hola " + (recipientName.isBlank() ? username : recipientName) + ",\n\n"
-                    + "Banco BanQuito ha creado su acceso digital.\n"
-                    + "Usuario: " + username + "\n"
-                    + "Token de activación: " + token + "\n"
-                    + "Vigencia: " + string(payload, "expiresInMinutes") + " minutos.\n"
-                    + "Active su cuenta desde: " + string(payload, "activationUrl") + "\n\n"
-                    + (switchAccess ? "Este usuario también queda habilitado para el portal de pagos masivos, una vez activada la cuenta.\n" : "")
-                    + "Por seguridad, el token es de un solo uso. Si usted no solicitó este acceso, comuníquese con Banco BanQuito.";
-        } else {
-            subject = internalOnboarding
-                    ? "Active su acceso interno a Banco BanQuito"
-                    : "Recuperación de contraseña de Banco BanQuito";
-            body = internalOnboarding
-                    ? "Hola " + username + ", use el siguiente token de un solo uso para definir su contraseña: " + token
-                    : "Hola " + username + ", use el siguiente token de un solo uso para restablecer su contraseña: " + token;
-        }
+        boolean switchAccess = "true".equalsIgnoreCase(string(payload, "switchAccessEnabled"));
 
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("sourceEventUuid", event.getUuidEvento());
@@ -111,22 +90,38 @@ public class IdentityNotificationOutboxDispatcher {
         request.put("priority", "ALTA");
         request.put("channelType", "EMAIL");
         request.put("actorUuid", event.getAgregadoId());
-        request.put("actorType", actorType);
+        request.put("actorType", internalOnboarding ? "EMPLEADO" : "CLIENTE");
         request.put("recipient", string(payload, "recipient"));
         request.put("recipientName", recipientName.isBlank() ? username : recipientName);
-        request.put("subject", subject);
-        request.put("body", body);
+        request.put("templateCode", resolveTemplateCode(internalOnboarding, customerOnboarding));
+        request.put("subject", null);
+        request.put("body", null);
+
         Map<String, Object> renderedPayload = new LinkedHashMap<>();
+        renderedPayload.put("nombre", recipientName.isBlank() ? username : recipientName);
         renderedPayload.put("username", username);
+        renderedPayload.put("usuario", username);
         renderedPayload.put("token", token);
+        renderedPayload.put("codigoTemporal", token);
         renderedPayload.put("expiresInMinutes", string(payload, "expiresInMinutes"));
+        renderedPayload.put("vigenciaMinutos", string(payload, "expiresInMinutes"));
         if (customerOnboarding) {
             renderedPayload.put("activationUrl", string(payload, "activationUrl"));
             renderedPayload.put("customerType", string(payload, "customerType"));
             renderedPayload.put("switchAccessEnabled", string(payload, "switchAccessEnabled"));
+            renderedPayload.put("switchAccessMessage", switchAccess
+                    ? "Este usuario también queda habilitado para el portal de pagos masivos una vez activada la cuenta."
+                    : "");
         }
         request.put("payload", renderedPayload);
         return request;
+    }
+
+    private String resolveTemplateCode(boolean internalOnboarding, boolean customerOnboarding) {
+        if (customerOnboarding) {
+            return CUSTOMER_ACTIVATION_TEMPLATE;
+        }
+        return internalOnboarding ? INTERNAL_ACTIVATION_TEMPLATE : PASSWORD_RESET_TEMPLATE;
     }
 
     private String string(Map<String, Object> payload, String key) {
